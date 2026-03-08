@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local run artifacts
+cache/
+logs/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
