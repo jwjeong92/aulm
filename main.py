@@ -56,6 +56,11 @@ def get_gptq_checkpoint_path(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     return ckpt_dir / safe_name
 
+def get_gptq_error_pattern_path(args):
+    ckpt_path = get_gptq_checkpoint_path(args)
+    prob_tag = str(args.w_bitflip_prob).replace('.', 'p')
+    return ckpt_path.with_name(f'{ckpt_path.stem}_bf{prob_tag}_seed{args.seed}.pattern.pt')
+
 def try_load_gptq_checkpoint(model, args):
     if not args.gptq_ckpt:
         return False
@@ -110,13 +115,19 @@ def main(args):
 
     # Quantization
     if args.bits_w < 16:
+        if args.w_bitflip_prob > 0:
+            logging.info(
+                f'Weight bit-flip injection enabled: prob={args.w_bitflip_prob}, bits={args.bits_w}'
+            )
         from lib.quantization.weight_quant import (
+            apply_weight_bitflip_with_pattern,
             quantize_gptq,
             quantize_nearest,
         )
         if args.gptq:
             # Case: gptq-only
             with logging_tag('GPTQ'):
+                original_bitflip_prob = args.w_bitflip_prob
                 loaded = try_load_gptq_checkpoint(model, args)
                 if not loaded:
                     ckpt_path = None
@@ -127,6 +138,8 @@ def main(args):
                         gptq_log_handler, gptq_log_path = setup_gptq_log_handler(ckpt_path)
                         logging.info(f'Writing GPTQ log to {gptq_log_path}')
                     try:
+                        # Keep GPTQ checkpoint as clean quantized weight; bit-flip is cached separately.
+                        args.w_bitflip_prob = 0.0
                         quantize_gptq(model, args, dev='cuda')
                         logging.info("Applied GPTQ quantization.")
                         if args.gptq_ckpt:
@@ -134,9 +147,13 @@ def main(args):
                             logging.info(f'Saved GPTQ checkpoint to {ckpt_path}')
                             logging.info(f'Saved GPTQ log to {gptq_log_path}')
                     finally:
+                        args.w_bitflip_prob = original_bitflip_prob
                         if gptq_log_handler is not None:
                             logging.getLogger().removeHandler(gptq_log_handler)
                             gptq_log_handler.close()
+                if original_bitflip_prob > 0:
+                    pattern_path = get_gptq_error_pattern_path(args) if args.gptq_ckpt else None
+                    apply_weight_bitflip_with_pattern(model, args, pattern_path=pattern_path)
         else:
             # Case: nearest-only
             quantize_nearest(model, args, dev='cuda')
@@ -220,6 +237,7 @@ if __name__ == '__main__':
     parser.add_argument('--bits_w', type=int, default=4)
     parser.add_argument('--sym_w', type=str2bool, default=False)
     parser.add_argument('--groupsize_w', type=int, default=-1)
+    parser.add_argument('--w_bitflip_prob', type=float, default=0.0)
     # SmoothQuant Configs
     parser.add_argument('--llm_int8', type=str2bool, default=False)
     parser.add_argument('--smoothquant', type=str2bool, default=False)

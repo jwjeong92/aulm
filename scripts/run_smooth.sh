@@ -19,6 +19,7 @@ groupsize_a=-1
 bits_w=8
 sym_w=false
 groupsize_w=-1
+w_bitflip_prob=0.0
 # SmoothQuant
 smoothquant=true
 smoothquant_alpha=0.55
@@ -61,6 +62,7 @@ CUDA_VISIBLE_DEVICES=$DEVICES python main.py \
     --bits_w $bits_w \
     --sym_w $sym_w \
     --groupsize_w $groupsize_w \
+    --w_bitflip_prob $w_bitflip_prob \
     --smoothquant $smoothquant \
     --smoothquant_alpha $smoothquant_alpha \
     --smoothquant_dataset $smoothquant_dataset \
