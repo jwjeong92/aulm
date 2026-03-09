@@ -121,6 +121,7 @@ def main(args):
             )
         from lib.quantization.weight_quant import (
             apply_weight_bitflip_with_pattern,
+            collect_rtn_hessian_diagonal,
             quantize_gptq,
             quantize_nearest,
         )
@@ -156,7 +157,10 @@ def main(args):
                     apply_weight_bitflip_with_pattern(model, args, pattern_path=pattern_path)
         else:
             # Case: nearest-only
-            quantize_nearest(model, args, dev='cuda')
+            hessian_diagonal = None
+            if args.gptq_act_order:
+                hessian_diagonal = collect_rtn_hessian_diagonal(model, args, dev='cuda')
+            quantize_nearest(model, args, dev='cuda', hessian_diagonal=hessian_diagonal)
             print("Applied nearest quantization.")
 
     # Activation Quantization

@@ -1,11 +1,13 @@
 # From https://github.com/IST-DASLab/gptq/blob/main/llama.py
 # Disable cpu offloading because of conflicts with transformers version (FIXME)
 
+import math
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import transformers
 
 from lib.gptq.gptq import *
 from lib.gptq.modelutils import *
@@ -247,6 +249,99 @@ def quantize_gptq(model, args, dev):
     else:
         raise NotImplementedError
 
+
+class HessianDiagCollector:
+
+    def __init__(self, layer):
+        self.layer = layer
+        self.dev = self.layer.weight.device
+        W = layer.weight.data.clone()
+        if isinstance(self.layer, nn.Conv2d):
+            W = W.flatten(1)
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        self.columns = W.shape[1]
+        self.hdiag = torch.zeros((self.columns,), device=self.dev)
+        self.nsamples = 0
+
+    def add_batch(self, inp):
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        tmp = inp.shape[0]
+        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
+            if len(inp.shape) == 3:
+                inp = inp.reshape((-1, inp.shape[-1]))
+            inp = inp.t()
+        if isinstance(self.layer, nn.Conv2d):
+            unfold = nn.Unfold(
+                self.layer.kernel_size,
+                dilation=self.layer.dilation,
+                padding=self.layer.padding,
+                stride=self.layer.stride
+            )
+            inp = unfold(inp)
+            inp = inp.permute([1, 0, 2])
+            inp = inp.flatten(1)
+
+        self.hdiag *= self.nsamples / (self.nsamples + tmp)
+        self.nsamples += tmp
+        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        self.hdiag += torch.sum(inp * inp, dim=1)
+
+
+@torch.no_grad()
+def collect_rtn_hessian_diagonal(model, args, dev):
+    from utils.data_utils import get_loaders
+
+    dataloader = get_loaders(
+        args.gptq_dataset, nsamples=args.gptq_nsamples,
+        seed=args.seed, model=args.model_path,
+        seqlen=args.gptq_seqlen, cache_dir=args.cache_dir,
+    )
+    logging.info(
+        'Collecting RTN Hessian diagonal '
+        f'(dataset={args.gptq_dataset}, nsamples={args.gptq_nsamples}, seqlen={args.gptq_seqlen})'
+    )
+
+    collectors = {
+        layer_name: HessianDiagCollector(linear)
+        for layer_name, linear in iter_quantized_linears(model, args)
+    }
+
+    def add_batch(layer_name):
+        def tmp(_, inp, out):
+            collectors[layer_name].add_batch(inp[0].data)
+        return tmp
+
+    handles = []
+    for layer_name, linear in iter_quantized_linears(model, args):
+        handles.append(linear.register_forward_hook(add_batch(layer_name)))
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    try:
+        for batch in dataloader:
+            model(batch[0].to(dev))
+    finally:
+        for h in handles:
+            h.remove()
+        model.config.use_cache = use_cache
+
+    hessian_diagonal = {}
+    missing = 0
+    for layer_name, collector in collectors.items():
+        if collector.nsamples == 0:
+            missing += 1
+            continue
+        hessian_diagonal[layer_name] = collector.hdiag.detach().cpu()
+
+    logging.info(
+        f'Collected RTN Hessian diagonal for {len(hessian_diagonal)} layers '
+        f'(missing={missing}).'
+    )
+    torch.cuda.empty_cache()
+    return hessian_diagonal
+
 def iter_quantized_linears(model, args):
     if 'llama' in args.model_path:
         layers = model.model.layers
@@ -344,16 +439,27 @@ def apply_weight_bitflip_with_pattern(model, args, pattern_path=None):
         )
         logging.info(f'Saved bit-flip pattern to {pattern_path}')
 
-def quantize_nearest(model, args, dev):
+def quantize_nearest(model, args, dev, hessian_diagonal=None):
     if 'llama' in args.model_path:
         layers = model.model.layers
+        prefix = 'model.layers'
     elif 'opt' in args.model_path:
         layers = model.model.decoder.layers
+        prefix = 'model.decoder.layers'
+    else:
+        raise NotImplementedError
+
+    use_act_order = bool(args.gptq_act_order and hessian_diagonal is not None)
+    if args.gptq_act_order and hessian_diagonal is None:
+        logging.warning(
+            'gptq_act_order=True but Hessian diagonal is missing; RTN will run without act_order.'
+        )
+
     for i in range(len(layers)):
         logging.info(f'Quantizing layer {i}')
         #layer = layers[i].to(dev)
         layer = layers[i]
-        
+
         subset = find_layers(layer)
         for name in subset:
             quantizer = Quantizer()
@@ -362,11 +468,34 @@ def quantize_nearest(model, args, dev):
             )
             W = subset[name].weight.data
             shape_ = W.shape
+            quant_input = W
+
+            layer_name = f'{prefix}.{i}.{name}'
+            invperm = None
+            if use_act_order:
+                hdiag = hessian_diagonal.get(layer_name, None)
+                if hdiag is None:
+                    logging.warning(f'No Hessian diagonal for {layer_name}; skipping act_order.')
+                elif W.dim() != 2:
+                    logging.warning(
+                        f'RTN act_order currently supports 2D weights only: {layer_name} has shape {tuple(W.shape)}.'
+                    )
+                elif hdiag.numel() != W.shape[1]:
+                    logging.warning(
+                        f'Hessian diagonal mismatch for {layer_name}: '
+                        f'expected {W.shape[1]}, got {hdiag.numel()}.'
+                    )
+                else:
+                    perm = torch.argsort(hdiag.to(W.device), descending=True)
+                    invperm = torch.argsort(perm)
+                    quant_input = quant_input[:, perm]
+
             if args.groupsize_w > 0:
-                W = W.reshape(-1, args.groupsize_w)
-            quantizer.find_params(W, weight=True)
+                quant_input = quant_input.reshape(-1, args.groupsize_w)
+
+            quantizer.find_params(quant_input, weight=True)
             qW = quantize_with_int_bitflip(
-                W,
+                quant_input,
                 quantizer.scale,
                 quantizer.zero,
                 quantizer.maxq,
@@ -374,4 +503,6 @@ def quantize_nearest(model, args, dev):
                 bitflip_bits=args.bits_w,
             ).to(next(iter(layer.parameters())).dtype)
             qW = qW.reshape(shape_)
+            if invperm is not None:
+                qW = qW[:, invperm]
             subset[name].weight.data = qW
