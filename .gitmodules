@@ -1,3 +1,7 @@
 [submodule "lm-evaluation-harness"]
 	path = lm-evaluation-harness
 	url = https://github.com/EleutherAI/lm-evaluation-harness.git
+[submodule "adaptive_unary_level_mapping"]
+	path = adaptive_unary_level_mapping
+	url = https://github.com/jwjeong92/adaptive_unary_level_mapping.git
+	branch = wip/surrogate-search-handoff-20260311

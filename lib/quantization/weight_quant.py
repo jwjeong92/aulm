@@ -455,6 +455,7 @@ def quantize_nearest(model, args, dev, hessian_diagonal=None):
             'gptq_act_order=True but Hessian diagonal is missing; RTN will run without act_order.'
         )
 
+    quantizers = {}
     for i in range(len(layers)):
         logging.info(f'Quantizing layer {i}')
         #layer = layers[i].to(dev)
@@ -471,6 +472,7 @@ def quantize_nearest(model, args, dev, hessian_diagonal=None):
             quant_input = W
 
             layer_name = f'{prefix}.{i}.{name}'
+            perm = None
             invperm = None
             if use_act_order:
                 hdiag = hessian_diagonal.get(layer_name, None)
@@ -506,3 +508,12 @@ def quantize_nearest(model, args, dev, hessian_diagonal=None):
             if invperm is not None:
                 qW = qW[:, invperm]
             subset[name].weight.data = qW
+            quantizers[f'{prefix}.{i}.{name}'] = {
+                'maxq': quantizer.maxq.detach().cpu().clone(),
+                'scale': quantizer.scale.detach().cpu().clone(),
+                'zero': quantizer.zero.detach().cpu().clone(),
+                'perm': perm.detach().cpu().clone() if use_act_order and hdiag is not None and invperm is not None else None,
+                'invperm': invperm.detach().cpu().clone() if invperm is not None else None,
+            }
+
+    return quantizers

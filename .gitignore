@@ -5,6 +5,7 @@ __pycache__/
 # Local run artifacts
 cache/
 logs/
+er_coding/runs/
 
 # OS/editor noise
 .DS_Store

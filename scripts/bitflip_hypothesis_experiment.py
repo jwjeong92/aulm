@@ -195,10 +195,11 @@ def collect_decoder_outputs_cache(model, eval_inputs, decoder_layers, cache_dtyp
 
 
 @torch.no_grad()
-def eval_loss_and_decoder_nmse(model, eval_inputs, decoder_layers, baseline_cache):
+def eval_loss_and_decoder_distortion(model, eval_inputs, decoder_layers, baseline_cache):
     n_layers = len(decoder_layers)
     numerator = np.zeros((n_layers,), dtype=np.float64)
     denominator = np.zeros((n_layers,), dtype=np.float64)
+    element_count = np.zeros((n_layers,), dtype=np.float64)
     loss_fct = torch.nn.CrossEntropyLoss().cuda()
     acc_loss = 0.0
 
@@ -241,10 +242,18 @@ def eval_loss_and_decoder_nmse(model, eval_inputs, decoder_layers, baseline_cach
             diff = cur - base
             numerator[i] += float(torch.sum(diff * diff).item())
             denominator[i] += float(torch.sum(base * base).item())
+            element_count[i] += float(diff.numel())
 
+    mse = numerator / np.maximum(element_count, 1.0)
     nmse = numerator / np.maximum(denominator, 1e-12)
     avg_loss = acc_loss / len(eval_inputs)
-    return avg_loss, nmse.tolist(), float(np.mean(nmse))
+    return {
+        "loss": float(avg_loss),
+        "mse": mse.tolist(),
+        "mean_mse": float(np.mean(mse)),
+        "nmse": nmse.tolist(),
+        "mean_nmse": float(np.mean(nmse)),
+    }
 
 
 @torch.no_grad()
@@ -543,6 +552,270 @@ def save_csv(rows, path):
         writer.writerows(rows)
 
 
+def extract_decoder_metric_array(row, key_prefix):
+    values = []
+    idx = 0
+    while True:
+        key = f"{key_prefix}_{idx}"
+        if key not in row:
+            break
+        values.append(float(row[key]))
+        idx += 1
+    return np.asarray(values, dtype=np.float64)
+
+
+def add_engineered_decoder_features(row):
+    target_idx = int(row["target_decoder_layer"])
+    mse = extract_decoder_metric_array(row, "mse_decoder_layer")
+    nmse = extract_decoder_metric_array(row, "nmse_decoder_layer")
+    if mse.size == 0 or nmse.size == 0:
+        return
+
+    downstream_mse = mse[target_idx:]
+    downstream_nmse = nmse[target_idx:]
+    rel_weights = np.arange(1, downstream_mse.size + 1, dtype=np.float64)
+    depth_weights = np.arange(1, mse.size + 1, dtype=np.float64)
+
+    row.update(
+        {
+            "last_decoder_mse": float(mse[-1]),
+            "last_decoder_nmse": float(nmse[-1]),
+            "max_decoder_mse": float(np.max(mse)),
+            "max_decoder_nmse": float(np.max(nmse)),
+            "downstream_mean_decoder_mse": float(np.mean(downstream_mse)),
+            "downstream_mean_decoder_nmse": float(np.mean(downstream_nmse)),
+            "downstream_sum_decoder_mse": float(np.sum(downstream_mse)),
+            "downstream_sum_decoder_nmse": float(np.sum(downstream_nmse)),
+            "downstream_weighted_decoder_mse": float(np.sum(rel_weights * downstream_mse)),
+            "downstream_weighted_decoder_nmse": float(np.sum(rel_weights * downstream_nmse)),
+            "depth_weighted_decoder_mse": float(np.sum(depth_weights * mse)),
+            "depth_weighted_decoder_nmse": float(np.sum(depth_weights * nmse)),
+        }
+    )
+
+
+def fit_linear_1d(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size == 0 or y.size == 0:
+        return float("nan"), float("nan")
+
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    denom = float(np.sum((x - x_mean) ** 2))
+    if denom == 0.0:
+        return y_mean, 0.0
+
+    slope = float(np.sum((x - x_mean) * (y - y_mean)) / denom)
+    intercept = float(y_mean - slope * x_mean)
+    return intercept, slope
+
+
+def loocv_linear_summary(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = int(x.size)
+    if n <= 1:
+        return {
+            "n": n,
+            "rmse": float("nan"),
+            "mae": float("nan"),
+            "r2": float("nan"),
+        }
+
+    preds = np.zeros((n,), dtype=np.float64)
+    for idx in range(n):
+        mask = np.ones((n,), dtype=bool)
+        mask[idx] = False
+        intercept, slope = fit_linear_1d(x[mask], y[mask])
+        preds[idx] = intercept + slope * x[idx]
+
+    residual = y - preds
+    ss_res = float(np.sum(residual * residual))
+    centered = y - float(np.mean(y))
+    ss_tot = float(np.sum(centered * centered))
+    return {
+        "n": n,
+        "rmse": float(np.sqrt(np.mean(residual * residual))),
+        "mae": float(np.mean(np.abs(residual))),
+        "r2": float(1.0 - ss_res / ss_tot) if ss_tot > 0.0 else float("nan"),
+    }
+
+
+def fit_linear_multi(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if y.size == 0:
+        return float("nan"), np.array([], dtype=np.float64)
+
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    design = np.column_stack([np.ones((y.size,), dtype=np.float64), x])
+    coeffs = np.linalg.lstsq(design, y, rcond=None)[0]
+    return float(coeffs[0]), coeffs[1:]
+
+
+def loocv_linear_multi_summary(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+
+    n = int(y.size)
+    if n <= 1:
+        return {
+            "n": n,
+            "rmse": float("nan"),
+            "mae": float("nan"),
+            "r2": float("nan"),
+        }
+
+    preds = np.zeros((n,), dtype=np.float64)
+    for idx in range(n):
+        mask = np.ones((n,), dtype=bool)
+        mask[idx] = False
+        intercept, slopes = fit_linear_multi(x[mask], y[mask])
+        preds[idx] = intercept + float(np.dot(x[idx], slopes))
+
+    residual = y - preds
+    ss_res = float(np.sum(residual * residual))
+    centered = y - float(np.mean(y))
+    ss_tot = float(np.sum(centered * centered))
+    return {
+        "n": n,
+        "rmse": float(np.sqrt(np.mean(residual * residual))),
+        "mae": float(np.mean(np.abs(residual))),
+        "r2": float(1.0 - ss_res / ss_tot) if ss_tot > 0.0 else float("nan"),
+    }
+
+
+def summarize_scalar_predictor(rows, feature_key, target_key):
+    x = np.array([row[feature_key] for row in rows], dtype=np.float64)
+    y = np.array([row[target_key] for row in rows], dtype=np.float64)
+    intercept, slope = fit_linear_1d(x, y)
+    summary = {
+        "feature_key": feature_key,
+        "target_key": target_key,
+        "n": int(len(rows)),
+        "pearson": pearson_corr(x, y),
+        "spearman": spearman_corr(x, y),
+        "linear_intercept": float(intercept),
+        "linear_slope": float(slope),
+    }
+    summary.update(loocv_linear_summary(x, y))
+    return summary
+
+
+def choose_better_predictor(lhs, rhs):
+    lhs_r2 = lhs["r2"]
+    rhs_r2 = rhs["r2"]
+    if math.isnan(lhs_r2):
+        return rhs
+    if math.isnan(rhs_r2):
+        return lhs
+    return lhs if lhs_r2 >= rhs_r2 else rhs
+
+
+def summarize_feature_set(rows, feature_keys, target_key):
+    x = np.column_stack(
+        [np.array([row[key] for row in rows], dtype=np.float64) for key in feature_keys]
+    )
+    y = np.array([row[target_key] for row in rows], dtype=np.float64)
+    intercept, slopes = fit_linear_multi(x, y)
+    summary = {
+        "feature_keys": list(feature_keys),
+        "target_key": target_key,
+        "n": int(len(rows)),
+        "linear_intercept": float(intercept),
+        "linear_coefficients": {
+            key: float(slopes[idx]) for idx, key in enumerate(feature_keys)
+        },
+    }
+    summary.update(loocv_linear_multi_summary(x, y))
+    return summary
+
+
+def summarize_layer_full_lsb_predictors(rows):
+    if not rows:
+        return {}
+
+    layer_count = len([k for k in rows[0].keys() if k.startswith("nmse_decoder_layer_")])
+    summary = {}
+    for target_key in ("delta_loss", "delta_ppl"):
+        mean_nmse = summarize_scalar_predictor(rows, "mean_decoder_nmse", target_key)
+        mean_mse = summarize_scalar_predictor(rows, "mean_decoder_mse", target_key)
+
+        best_nmse = None
+        best_mse = None
+        for idx in range(layer_count):
+            nmse_summary = summarize_scalar_predictor(
+                rows, f"nmse_decoder_layer_{idx}", target_key
+            )
+            mse_summary = summarize_scalar_predictor(
+                rows, f"mse_decoder_layer_{idx}", target_key
+            )
+            best_nmse = nmse_summary if best_nmse is None else choose_better_predictor(best_nmse, nmse_summary)
+            best_mse = mse_summary if best_mse is None else choose_better_predictor(best_mse, mse_summary)
+
+        summary[target_key] = {
+            "mean_decoder_nmse": mean_nmse,
+            "mean_decoder_mse": mean_mse,
+            "best_single_nmse_layer": best_nmse,
+            "best_single_mse_layer": best_mse,
+        }
+    return summary
+
+
+def summarize_engineered_layer_predictors(rows):
+    if not rows:
+        return {}
+
+    candidate_sets = {
+        "target_only": ["target_decoder_layer"],
+        "last_mse": ["last_decoder_mse"],
+        "last_nmse": ["last_decoder_nmse"],
+        "downstream_weighted_mse": ["downstream_weighted_decoder_mse"],
+        "downstream_weighted_nmse": ["downstream_weighted_decoder_nmse"],
+        "depth_weighted_mse": ["depth_weighted_decoder_mse"],
+        "depth_weighted_nmse": ["depth_weighted_decoder_nmse"],
+        "target_plus_last_mse": ["target_decoder_layer", "last_decoder_mse"],
+        "target_plus_last_nmse": ["target_decoder_layer", "last_decoder_nmse"],
+        "target_plus_downstream_weighted_mse": [
+            "target_decoder_layer",
+            "downstream_weighted_decoder_mse",
+        ],
+        "target_plus_downstream_weighted_nmse": [
+            "target_decoder_layer",
+            "downstream_weighted_decoder_nmse",
+        ],
+        "target_plus_last_plus_downstream_mse": [
+            "target_decoder_layer",
+            "last_decoder_mse",
+            "downstream_weighted_decoder_mse",
+        ],
+        "target_plus_last_plus_downstream_nmse": [
+            "target_decoder_layer",
+            "last_decoder_nmse",
+            "downstream_weighted_decoder_nmse",
+        ],
+    }
+
+    summary = {}
+    for target_key in ("delta_loss", "delta_ppl"):
+        per_set = {}
+        best = None
+        for label, feature_keys in candidate_sets.items():
+            result = summarize_feature_set(rows, feature_keys, target_key)
+            per_set[label] = result
+            best = result if best is None else choose_better_predictor(best, result)
+
+        summary[target_key] = {
+            "candidate_feature_sets": per_set,
+            "best_feature_set": best,
+        }
+    return summary
+
+
 def run_layer_full_lsb_sweep(model, args, eval_inputs, baseline_loss, baseline_ppl):
     decoder_layers = get_decoder_layers(model, args)
     n_layers = len(decoder_layers)
@@ -559,12 +832,13 @@ def run_layer_full_lsb_sweep(model, args, eval_inputs, baseline_loss, baseline_p
         modules = get_decoder_layer_linears(model, args, target_idx)
         backups, flipped_weights = apply_full_lsb_flip_to_modules(modules, args)
         try:
-            loss, nmse_list, mean_nmse = eval_loss_and_decoder_nmse(
+            distortion = eval_loss_and_decoder_distortion(
                 model, eval_inputs, decoder_layers, baseline_cache
             )
         finally:
             restore_modules_from_backups(modules, backups)
 
+        loss = distortion["loss"]
         ppl = math.exp(loss)
         row = {
             "target_decoder_layer": int(target_idx),
@@ -574,14 +848,19 @@ def run_layer_full_lsb_sweep(model, args, eval_inputs, baseline_loss, baseline_p
             "delta_loss": float(loss - baseline_loss),
             "ppl": float(ppl),
             "delta_ppl": float(ppl - baseline_ppl),
-            "mean_decoder_nmse": float(mean_nmse),
+            "mean_decoder_mse": float(distortion["mean_mse"]),
+            "mean_decoder_nmse": float(distortion["mean_nmse"]),
         }
-        for j, v in enumerate(nmse_list):
+        for j, v in enumerate(distortion["mse"]):
+            row[f"mse_decoder_layer_{j}"] = float(v)
+        for j, v in enumerate(distortion["nmse"]):
             row[f"nmse_decoder_layer_{j}"] = float(v)
+        add_engineered_decoder_features(row)
         rows.append(row)
 
         logging.info(
             f"[layer {target_idx}] delta_ppl={row['delta_ppl']:.6f}, "
+            f"mean_decoder_mse={row['mean_decoder_mse']:.6e}, "
             f"mean_decoder_nmse={row['mean_decoder_nmse']:.6e}, "
             f"flipped_weights={flipped_weights}"
         )
@@ -590,6 +869,7 @@ def run_layer_full_lsb_sweep(model, args, eval_inputs, baseline_loss, baseline_p
         raise RuntimeError("No rows produced for layer_full_lsb sweep.")
 
     delta_ppl_vals = np.array([r["delta_ppl"] for r in rows], dtype=np.float64)
+    mean_mse_vals = np.array([r["mean_decoder_mse"] for r in rows], dtype=np.float64)
     mean_nmse_vals = np.array([r["mean_decoder_nmse"] for r in rows], dtype=np.float64)
     summary = {
         "n_decoder_layers": int(n_layers),
@@ -598,8 +878,28 @@ def run_layer_full_lsb_sweep(model, args, eval_inputs, baseline_loss, baseline_p
         "worst_delta_ppl_layer": int(rows[int(np.argmin(delta_ppl_vals))]["target_decoder_layer"]),
         "worst_delta_ppl": float(np.min(delta_ppl_vals)),
         "mean_delta_ppl": float(np.mean(delta_ppl_vals)),
+        "corr_delta_loss_vs_mean_decoder_mse": pearson_corr(
+            [r["mean_decoder_mse"] for r in rows],
+            [r["delta_loss"] for r in rows],
+        ),
+        "corr_delta_ppl_vs_mean_decoder_mse": pearson_corr(
+            [r["mean_decoder_mse"] for r in rows],
+            [r["delta_ppl"] for r in rows],
+        ),
+        "corr_delta_loss_vs_mean_decoder_nmse": pearson_corr(
+            [r["mean_decoder_nmse"] for r in rows],
+            [r["delta_loss"] for r in rows],
+        ),
+        "corr_delta_ppl_vs_mean_decoder_nmse": pearson_corr(
+            [r["mean_decoder_nmse"] for r in rows],
+            [r["delta_ppl"] for r in rows],
+        ),
+        "max_mean_decoder_mse_layer": int(rows[int(np.argmax(mean_mse_vals))]["target_decoder_layer"]),
+        "max_mean_decoder_mse": float(np.max(mean_mse_vals)),
         "max_mean_decoder_nmse_layer": int(rows[int(np.argmax(mean_nmse_vals))]["target_decoder_layer"]),
         "max_mean_decoder_nmse": float(np.max(mean_nmse_vals)),
+        "predictor_summary": summarize_layer_full_lsb_predictors(rows),
+        "engineered_predictor_summary": summarize_engineered_layer_predictors(rows),
     }
     return rows, summary
 
